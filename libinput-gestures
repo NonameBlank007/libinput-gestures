@@ -18,9 +18,11 @@ import sys
 import threading
 from abc import ABC
 from collections.abc import Callable, Iterator, Sequence
+from contextlib import suppress
 from io import TextIOWrapper
 from pathlib import Path
 from time import monotonic
+from typing import ClassVar
 
 VERSION = '2.80'
 
@@ -71,7 +73,7 @@ def open_lock(user: str) -> tuple[TextIOWrapper | None, TextIOWrapper | None]:
     flock_fp = flock.open('w')
     try:
         fcntl.lockf(flock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except IOError:
+    except OSError:
         return None, None
 
     # Return lock file and pid file handles
@@ -84,7 +86,7 @@ def runcmd(cmd: Sequence[str], *, check: bool = True, block: bool = True) -> str
         if block:
             result = subprocess.check_output(
                 cmd,
-                universal_newlines=True,
+                text=True,
                 stderr=(None if check else subprocess.DEVNULL),
             )
         else:
@@ -175,7 +177,7 @@ def get_device_info(
     # or, failing that, 1st device with trackpad in it's name
     for txt in ('touch ?pad', 'track ?pad'):
         for d in devices:
-            if re.search(txt, d.get('device', ''), re.I):
+            if re.search(txt, d.get('device', ''), re.IGNORECASE):
                 return d
 
     return touchpads[0] if touchpads else {}
@@ -241,7 +243,7 @@ class MyArgumentParser(argparse.ArgumentParser):
     "Custom ArgumentParser to return error text"
 
     def error(self, message):
-        raise Exception(message)
+        sys.exit(message)
 
 
 @add_internal_command
@@ -251,21 +253,21 @@ class COMMAND_internal(COMMAND):
     # Commands currently supported follow. Each is configured with the
     # (X,Y) translation to be applied to the desktop grid.
     commands = (
-        ('ws_up', (0, 1)),  # noqa: E241,E201
-        ('ws_down', (0, -1)),  # noqa: E241,E201
-        ('ws_left', (1, 0)),  # noqa: E241,E201
-        ('ws_right', (-1, 0)),  # noqa: E241,E201
-        ('ws_left_up', (1, 1)),  # noqa: E241,E201
-        ('ws_left_down', (1, -1)),  # noqa: E241,E201
-        ('ws_right_up', (-1, 1)),  # noqa: E241,E201
-        ('ws_right_down', (-1, -1)),  # noqa: E241,E201
+        ('ws_up', (0, 1)),
+        ('ws_down', (0, -1)),
+        ('ws_left', (1, 0)),
+        ('ws_right', (-1, 0)),
+        ('ws_left_up', (1, 1)),
+        ('ws_left_down', (1, -1)),
+        ('ws_right_up', (-1, 1)),
+        ('ws_right_down', (-1, -1)),
     )
 
-    commands_list = [c[0] for c in commands]
+    commands_list: ClassVar = [c[0] for c in commands]
 
-    CMDTEST = 'wmctrl -m'.split()
-    CMDLIST = 'wmctrl -d'.split()
-    CMDSET = 'wmctrl -s'.split()
+    CMDTEST: ClassVar = 'wmctrl -m'.split()
+    CMDLIST: ClassVar = 'wmctrl -d'.split()
+    CMDSET: ClassVar = 'wmctrl -s'.split()
 
     def __init__(self, largs: list):
         "Action internal swipe commands"
@@ -355,11 +357,10 @@ class COMMAND_internal(COMMAND):
                 if self.nowrap:
                     return None
                 index += cols - 1
-                if index >= num:
-                    if self.ymove == 0:
-                        if self.nowrap:
-                            return None
-                        index = num - 1
+                if index >= num and self.ymove == 0:
+                    if self.nowrap:
+                        return None
+                    index = num - 1
             else:
                 index += count
         elif count > 0:
@@ -412,7 +413,7 @@ class GESTURE(ABC):
 
     extended_text = ''
     option_text = ''
-    SUPPORTED_MOTIONS: tuple = tuple()
+    SUPPORTED_MOTIONS = ()
 
     def check_option(self, option) -> str | None:
         return None
@@ -428,12 +429,11 @@ class GESTURE(ABC):
         "Add a configured motion command for this gesture"
         motion_key = motion
 
-        if self.option_text:
-            if self.option_text in motion:
-                motion_key, option = motion.split(self.option_text, maxsplit=1)
-                err = self.check_option(option)
-                if err:
-                    return err
+        if self.option_text and self.option_text in motion:
+            motion_key, option = motion.split(self.option_text, maxsplit=1)
+            err = self.check_option(option)
+            if err:
+                return err
 
         if motion_key not in self.SUPPORTED_MOTIONS:
             opts = '" or "'.join(self.SUPPORTED_MOTIONS)
@@ -445,6 +445,7 @@ class GESTURE(ABC):
                 f'Gesture {self.name.lower()} does not support '
                 f'motion "{motion_key}".\nMust be "{opts}"'
             )
+
         if not command:
             return 'No command configured'
 
@@ -608,7 +609,7 @@ class HOLD(GESTURE):
 
         # We parse the motions table to set up a table of delays for efficient
         # lookup at run time.
-        for finger in range(0, 6):
+        for finger in range(6):
             fstr = str(finger)
 
             # Explicit finger count delays inherit from 0 finger count delays
@@ -786,9 +787,11 @@ def dbus_listener() -> None:
 
     def proc(busname: str, vals: dict[str, str], _) -> None:
         global session_locked
-        if busname == 'org.freedesktop.login1.Session':
-            if (val := vals.get('LockedHint')) is not None:
-                session_locked = bool(val)
+        if (
+            busname == 'org.freedesktop.login1.Session'
+            and (val := vals.get('LockedHint')) is not None
+        ):
+            session_locked = bool(val)
 
     # Listen to get session locked state
     dbus.SystemBus().add_signal_receiver(
@@ -945,7 +948,7 @@ def main() -> None:
         t.start()
 
     cmd = subprocess.Popen(
-        shlex.split(command), stdout=subprocess.PIPE, bufsize=1, universal_newlines=True
+        shlex.split(command), stdout=subprocess.PIPE, bufsize=1, text=True
     )
 
     # Store PIDs for potential kill
@@ -973,22 +976,17 @@ def main() -> None:
         split1, split2 = line.split(' +', maxsplit=1)
 
         gevent = split1.split(maxsplit=2)[1]
-        try:
+        with suppress(Exception):
             gesture, event = gevent[8:].split('_')
-        except Exception:
-            continue
 
         _, fingers, *argslist = split2.split(maxsplit=2)
         params = argslist[0].rstrip() if argslist else ''
 
         # Action each type of event
         if event == 'UPDATE':
-            if handler:
-                # Split parameters into list of clean numbers
-                if not handler.update(re.split(r'[^-.\d]+', params)):
-                    print(
-                        f'Could not parse {gesture} {event}: {params}', file=sys.stderr
-                    )
+            # Split parameters into list of clean numbers
+            if handler and not handler.update(re.split(r'[^-.\d]+', params)):
+                print(f'Could not parse {gesture} {event}: {params}', file=sys.stderr)
 
         elif event == 'BEGIN':
             if handler := handlers.get(gesture):
